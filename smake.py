@@ -1,0 +1,137 @@
+import argparse, json, os, re
+import requests
+
+ENDPOINT_URL = "http://localhost"
+PLATFORM_AUTH = ("silimate", os.environ["SILIMATE_PASSWORD"])
+
+def get_flow_status(dag):
+  '''String containing status of flow from DAG object'''
+  status = []
+  if dag["has_import_errors"]:
+    status.append("errors")
+  if dag["is_active"]:
+    status.append("active")
+  if dag["is_paused"]:
+    status.append("paused")
+  status = "(" + ", ".join(status) + ")"
+  return status
+
+def log_reformat(log, step_name):
+  '''Reformat log from Silimate platform'''
+  return "\n".join(f"[{step_name}] " + l.split("[base]")[-1] if "[base]" in l else f"[scheduler] {l}" for l in log.split("\n"))
+
+# TODO: BETTER ERROR HANDLING, CATCH THOSE 404s
+def main():
+  # Create the parser
+  parser = argparse.ArgumentParser(description="Silimake - Command-line interface (CLI) for Silimate platform")
+
+  # Add arguments
+  parser.add_argument("-f", "--flow", type=str, default=None, help="Name of the flow (default: current directory name)")
+  parser.add_argument("-fr", "--flow-run", type=str, default=None, help="Name of the flow run (default: UNIX timestamp for new flow run, latest for prior run)")
+  parser.add_argument("-s", "--step", type=str, default=None, help="Name of the step")
+
+  # Make the action mutually exclusive
+  group = parser.add_mutually_exclusive_group(required=True)
+  group.add_argument("-l", "-ls", "--list", action="store_true", help="List all available flows/flow runs/flow steps and their status")
+  group.add_argument("-m", "--monitor", action="store_true", help="Monitor the selected flow run")
+  group.add_argument("-r", "--run", action="store_true", help="Run the selected flow")
+  group.add_argument("-p", "--pause", action="store_true", help="Pause the selected flow run")
+  group.add_argument("-up", "--unpause", action="store_true", help="Unpause the selected flow run")
+  group.add_argument("-k", "--kill", action="store_true", help="Kill the selected flow run")
+
+  # Specify filter, from and to steps
+  parser.add_argument("--filter", type=str, help="Find all available flows/flow runs/flow steps matching the given regular expression")
+  parser.add_argument("--from-step", type=str, default=None, help="Start from a specific step")
+
+  # Parse the command-line arguments and take action
+  args = parser.parse_args()
+  try:
+    # List/find
+    if args.list:
+      if args.flow is None:
+        for dag in requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags", auth=PLATFORM_AUTH).json()["dags"]:
+          if args.filter and not re.match(args.filter, dag["dag_id"]):
+            continue
+          if dag["dag_id"].startswith("sensor"):
+            pass
+          print(dag["dag_id"], get_flow_status(dag))
+      else:
+        if args.flow_run is None:
+          for dag_run in requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns", auth=PLATFORM_AUTH).json()["dag_runs"]:
+            if args.filter and not re.match(args.filter, dag_run["dag_run_id"]):
+              continue
+            print(dag_run["dag_run_id"], f"({dag_run['state']})")
+        else:
+          for task_instance in requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances", auth=PLATFORM_AUTH).json()["task_instances"]:
+            if args.filter and not re.match(args.filter, task_instance["task_id"]):
+              continue
+            print(task_instance["task_id"], f"({task_instance['state']})")
+
+    # Default flow specified by directory name
+    if args.flow is None:
+      args.flow = os.getcwd().split("/")[-1]
+
+    # Run
+    if args.run:
+      if args.flow_run is not None:
+        if args.step is not None:
+          requests.post(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/clearTaskInstances", json={"dag_run_id": args.flow_run, "dry_run": False, "task_ids": [args.step], "reset_dag_runs": True, "only_failed": False, "include_downstream": False}, auth=PLATFORM_AUTH)
+        elif args.flow_run in [dag_run["dag_run_id"] for dag_run in requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns", auth=PLATFORM_AUTH).json()["dag_runs"]]:
+          if args.from_step is None:
+            print(f"Flow run {args.flow_run} already exists, specify --from to reuse flow run")
+            exit(1)
+          else:
+            requests.post(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/clearTaskInstances", json={"dag_run_id": args.flow_run, "dry_run": False, "task_ids": [args.step], "reset_dag_runs": True, "only_failed": False, "include_downstream": True}, auth=PLATFORM_AUTH)
+        else:
+          if requests.patch(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}", json={"is_paused": False}, auth=PLATFORM_AUTH).status_code == 200:
+            print(f"Flow {args.flow} unpaused")
+          resp = requests.post(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns", json={"dag_run_id": args.flow_run} if args.flow_run else {}, auth=PLATFORM_AUTH)
+          if resp.status_code == 200:
+            print(f"Flow {args.flow} triggered, creating new run {resp.json()['dag_run_id']}")
+          args.flow_run = resp.json()["dag_run_id"]
+
+      # Wait for flow run to start
+      args.monitor = True
+      while len(requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances?state=running&state=queued&state=scheduled&state=up_for_retry", auth=PLATFORM_AUTH).json()["task_instances"]) == 0:
+        print("Waiting for flow run to start...")
+    # Pause/Unpause
+    if args.pause or args.unpause:
+      if args.flow_run is not None or args.step is not None:
+        print("Only flow-level pausing is supported")
+        exit(1)
+      else:
+        if requests.patch(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}", json={"is_paused": args.pause}, auth=PLATFORM_AUTH).status_code == 200:
+          print(f"Flow {args.flow} {'un' if args.unpause else ''}paused")
+    # Kill
+    if args.kill:
+      if args.flow_run is None:
+        args.flow_run = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns", auth=PLATFORM_AUTH).json()["dag_runs"][-1]["dag_run_id"]
+      task_instances = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances?state=running&state=queued&state=scheduled&state=up_for_retry", auth=PLATFORM_AUTH).json()["task_instances"]
+      if len(task_instances) == 0:
+        print("No running steps found")
+      for task_instance in task_instances:
+        print("Failing step", task_instance["task_id"], "...")
+        requests.patch(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances/{task_instance['task_id']}", json={"dry_run": False, "new_state": "failed"}, auth=PLATFORM_AUTH)
+      if requests.patch(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}", json={"is_paused": args.pause}, auth=PLATFORM_AUTH).status_code == 200:
+        print(f"Flow {args.flow} paused")
+
+    # Monitor
+    if args.monitor:
+      if args.flow_run is None:
+        args.flow_run = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns", auth=PLATFORM_AUTH).json()["dag_runs"][-1]["dag_run_id"]
+      log_token = {}
+      task_instances = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances?state=running&state=queued&state=scheduled&state=up_for_retry", auth=PLATFORM_AUTH).json()["task_instances"]
+      while len(task_instances) > 0:
+        for task_instance in task_instances:
+          log_token_param = f"?token={log_token[task_instance['task_id']]}" if task_instance['task_id'] in log_token else ""
+          resp = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances/{task_instance['task_id']}/logs/{task_instance['try_number']}" + log_token_param, auth=PLATFORM_AUTH, headers={"Accept": "application/json"}).json()
+          log_token[task_instance["task_id"]] = resp["continuation_token"]
+          print(log_reformat(eval(resp["content"])[0][1], task_instance["task_id"]), end="")
+          task_instances = requests.get(f"{ENDPOINT_URL}/flow/api/v1/dags/{args.flow}/dagRuns/{args.flow_run}/taskInstances?state=running&state=queued&state=scheduled&state=up_for_retry", auth=PLATFORM_AUTH).json()["task_instances"]
+
+  except requests.exceptions.ConnectionError as e:
+    print(f"Unable to connect to Silimate platform\n{e}")
+    exit(1)
+
+if __name__ == "__main__":
+    main()
