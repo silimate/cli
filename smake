@@ -2,7 +2,7 @@
 import argparse, os, re
 import requests
 
-ENDPOINT_URL = "http://localhost"
+ENDPOINT_URL = os.environ["SILIMATE_ENDPOINT"]
 PLATFORM_AUTH = ("silimate", os.environ["SILIMATE_PASSWORD"])
 
 def get_flow_status(dag):
