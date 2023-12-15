@@ -34,7 +34,7 @@ def main():
   # Make the action mutually exclusive
   group = parser.add_mutually_exclusive_group(required=True)
   group.add_argument("-l", "-ls", "--list", action="store_true", help="List all available flows/flow runs/flow steps and their status")
-  group.add_argument("-m", "--monitor", action="store_true", help="Monitor the selected flow run")
+  group.add_argument("-m", "--monitor", action="store_true", help="Monitor the selected flow run (stream logs to stdout)")
   group.add_argument("-r", "--run", action="store_true", help="Run the selected flow")
   group.add_argument("-p", "--pause", action="store_true", help="Pause the selected flow run")
   group.add_argument("-up", "--unpause", action="store_true", help="Unpause the selected flow run")
